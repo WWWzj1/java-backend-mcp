@@ -1,421 +1,458 @@
 # ARCHITECTURE --- Java Backend MCP Server
 
-> 项目：`java-backend-mcp`\
-> 文档版本：Draft 0.1\
-> 目标：定义可演进、可测试、与 MCP 协议适配层解耦的 Java
-> 后端工程分析架构。
+> 项目：`java-backend-mcp`
+> 文档版本：Draft 0.2
+> 目标：定义可演进、可测试、与 MCP 协议适配层解耦的 Java 后端工程分析架构
+> 契约来源：结果结构以 `docs/result-contract.md` 为准；安全要求以
+> `docs/SECURITY.md` 为准。本文只描述实现结构与依赖方向。
 
 ## 1. 架构目标
 
-1.  让 MCP Client 能以稳定工具接口调用 Java 工程分析能力。
-2.  将文件扫描、解析、规则分析和结果构建放在独立分析层。
-3.  每项发现都尽可能携带可复核证据。
-4.  支持从 V0.1 项目画像和工程诊断演进到调用链、影响分析。
-5.  将安全边界落实在 Workspace 和数据访问基础设施中。
-6.  让分析核心可脱离 MCP 层进行单元测试和集成测试。
+1. 让 MCP Client 能以稳定 Tool 接口调用 Java 工程分析能力。
+2. 把文件访问、解析、规则分析和结果构建分层，核心分析不依赖 MCP 类型。
+3. 每项结论都尽可能携带可复核证据，且证据支持多跳路径。
+4. V0.1 只交付可验证的项目画像与依赖/配置/Mapper 诊断，不承诺调用链。
+5. 安全边界落实在 Workspace 端口与输出边界，而不是散落在各分析器里。
+6. 分析核心可脱离 MCP、脱离真实文件系统做单元测试。
 
 ## 2. 总体架构
 
-``` text
+```text
 +------------------------------------------------------+
 |                 MCP Clients                          |
 |             Codex / Claude Code / ...                |
 +---------------------------+--------------------------+
-                            |
-                       MCP STDIO
-                            |
+                            |  MCP STDIO
 +---------------------------v--------------------------+
 |                 MCP Adapter Layer                    |
-| Spring AI MCP Server | Tool definitions | Schemas    |
+|  Tool 注册 | 入参 schema | 结果序列化 | 协议错误映射   |
 +---------------------------+--------------------------+
                             |
 +---------------------------v--------------------------+
 |                Application Layer                     |
-| ProjectInspectionService                              |
-| MavenAnalysisService                                  |
-| SpringAnalysisService                                 |
-| MyBatisAnalysisService                                |
-| Use-case orchestration / validation                  |
+|  用例编排 | 授权校验 | 预算与超时 | 结果聚合 | 错误映射 |
 +---------------------------+--------------------------+
                             |
 +---------------------------v--------------------------+
 |                  Analysis Engine                     |
-| Project Model | Maven Model | Spring Model           |
-| Mapper Model  | SQL Model   | Rules                  |
-| Evidence Collection | Finding Aggregation            |
+|  领域模型 | 分析器 | 规则 | 证据构建 | 端口定义         |
++---------------------------^--------------------------+
+                            |  端口实现（依赖倒置）
 +---------------------------+--------------------------+
-                            |
-+---------------------------v--------------------------+
 |                Infrastructure Layer                   |
-| Workspace Access | File Readers | Parsers             |
-| Maven Resolver   | Path Guard   | Redaction            |
-| Metrics / Logging / Configuration                     |
+|  Workspace | 文件读取 | XML/Java/SQL/Maven 解析适配    |
+|  脱敏 | 配置 | 日志                                     |
 +---------------------------+--------------------------+
                             |
 +---------------------------v--------------------------+
 |                Authorized Workspace                  |
-| pom.xml | Java Sources | application.yml | Mapper XML |
 +------------------------------------------------------+
 ```
 
-依赖方向原则：MCP Adapter → Application → Analysis
-Engine；Infrastructure
-为分析引擎和应用层提供接口实现。核心分析模型不依赖 Spring AI MCP 类型。
+**依赖方向（硬约束）**
 
-## 3. 技术选型原则
+```text
+Adapter → Application → Analysis ← Infrastructure
+```
 
-### 3.1 已确定方向
+- 外层可以依赖内层，内层不得依赖外层。
+- `analysis` 不得 import `mcp`、Spring AI MCP 类型或 `infrastructure`。
+- `application` 不得 import `infrastructure`；只依赖 `analysis` 的端口与用例。
+- `infrastructure` 实现 `analysis` 中定义的端口，可以依赖 `analysis` 的模型。
+- 该规则用 ArchUnit 或等价的包依赖测试固化。
 
--   Java；
--   Spring Boot；
--   Spring AI MCP；
--   V0.1 使用 STDIO Transport；
--   JUnit 5；
--   GitHub Actions。
+## 3. 技术选型
 
-### 3.2 候选解析技术
+### 3.1 已确定
 
-具体依赖版本和兼容性必须在实施前核验，不在本文锁定未经验证的版本。
+- Java + Spring Boot + Spring AI MCP。
+- V0.1 仅 STDIO Transport。
+- JUnit 5 + GitHub Actions。
+- 具体版本在实施前核验兼容矩阵，本文不锁定版本号。
 
-  ------------------------------------------------------------------------------------
-  领域                    候选技术                  用途
-  ----------------------- ------------------------- ----------------------------------
-  Java 源码               JavaParser                AST、类型/方法声明、基础调用关系
+### 3.2 解析与建模
 
-  Maven                   Maven Model、Maven        POM 模型、依赖解析、依赖路径
-                          Resolver / Invoker        
+| 领域 | 选型 | V0.1 使用边界 |
+| --- | --- | --- |
+| Java 源码 | JavaParser | 仅声明级 + 名称级；不引入 symbol solver，不做跨模块类型解析 |
+| Maven | Maven Model + Maven Resolver（进程内 API） | 只读、离线优先；**禁止使用 maven-invoker，禁止执行 mvn/插件** |
+| Spring | 自建静态模型 + 配置解析 | 只做配置键、组件扫描范围、注解声明的 Bean 候选 |
+| YAML | SnakeYAML（安全 LoaderOptions） | 禁止默认构造器；限制别名与文档大小 |
+| Properties | Java `Properties` / 自建解析 | 保留行号与键，值按敏感规则掩码 |
+| MyBatis | 安全 XML 解析器 | 不联网加载 DTD；不做运行时求值 |
+| SQL | JSQLParser | 解析失败降级为 `UNSUPPORTED_SYNTAX`，不猜测 |
+| 测试 | JUnit 5 + 契约测试 + 安全测试 | 见第 14 节 |
 
-  Spring                  自建静态模型 + 配置解析   配置、组件扫描、Bean 候选关系
+### 3.3 明确排除
 
-  YAML/Properties         SnakeYAML（安全配置）及   配置解析
-                          Java Properties API       
-
-  MyBatis                 XML Parser / DOM + Java   Mapper XML 与接口映射
-                          源码解析                  
-
-  SQL                     JSQLParser                SQL 结构提取和规则分析
-
-  测试                    JUnit 5                   单元与集成测试
-  ------------------------------------------------------------------------------------
-
-选型要求： - 优先成熟、维护活跃、许可证兼容的库； -
-避免为简单任务引入重量级依赖； - 不执行目标项目 Maven
-插件或构建脚本来"分析"项目； - 对解析器不支持的语法给出
-unsupported/warning，而不是静默产生错误结论。
+- 不执行目标项目的构建、插件、脚本、测试。
+- 不加载目标项目的类，不使用反射读取目标项目运行时状态。
+- 不引入规则注册中心、SPI、插件加载器（V0.1）。
+- 不引入独立数据库、消息队列或服务注册中心。
 
 ## 4. 分层职责
 
-### 4.1 MCP Adapter Layer
+### 4.1 MCP Adapter
 
-职责： - 注册 MCP Tools； - 定义输入参数和描述； - 将 MCP 请求映射为
-Application 层用例； - 将统一结果模型序列化为 MCP 返回内容； -
-将可预期异常转换为稳定错误结构。
+职责：
+- 注册 4 个 Tool，定义入参 schema 与描述。
+- 只做 schema 级校验（类型、必填、枚举、数值范围）。
+- 调用 Application 用例，把返回的统一结果序列化为 MCP 响应。
+- 把协议级异常映射为 MCP 错误。
 
-禁止： - 在 Tool 方法里直接遍历大量文件； - 在 Tool 方法里实现
-Maven、Spring 或 SQL 规则； - 在 Tool 方法里拼装各自独立的 JSON 结构； -
-直接访问任意文件系统路径而绕过 Workspace 安全检查。
+禁止：
+- 遍历文件、解析 POM/XML/Java。
+- 实现任何规则。
+- 自行拼装 JSON 结构（必须使用统一契约）。
+- 直接访问文件系统。
 
-### 4.2 Application Layer
+### 4.2 Application
 
-职责： - 编排单次分析用例； - 校验输入和用户授权的 Workspace； -
-调用所需解析器、模型构建器和规则； - 管理超时、扫描限制和结果聚合； -
-返回统一结果模型。
+职责：
+- 校验 `workspaceId` 是否在启动期白名单内。
+- 解析 `scope` 与 `budget`，构造本次分析的预算与超时。
+- 编排一个完整用例（例如"分析依赖"），调用 Analysis 的用例服务。
+- 聚合结果、判定 `status`（OK/PARTIAL/FAILED）。
+- 把内部异常映射为 `AnalysisError`。
 
-Application 层表达"要完成什么用例"，不承载底层 AST 或 SQL 解析细节。
+禁止：
+- 解析 AST、XML、POM。
+- 直接 import `infrastructure`。
+- 承载具体规则逻辑。
 
 ### 4.3 Analysis Engine
 
-职责： - 将源文件和配置转换为领域模型； - 构建模块、Bean、Mapper、SQL
-等关系； - 运行确定性规则； - 生成 Finding 和 Evidence； -
-标记分析覆盖范围、未知项和不确定性。
+职责：
+- 定义领域模型：`ProjectModel`、`ModuleModel`、`DependencyTree`、
+  `SpringConfigModel`、`MapperModel`、`SqlStatementModel`、`Finding`、
+  `Evidence`、`SymbolId`。
+- 定义端口（见 4.5）。
+- 实现分析器与规则：Maven、Spring、MyBatis、SQL。
+- 构建证据并标注 `certainty` / `unresolved`。
+- 维护覆盖范围统计（扫描/跳过/截断）。
 
-建议领域模型： - `ProjectModel` - `ModuleModel` - `TechnologyProfile` -
-`DependencyGraph` - `SpringConfigurationModel` - `BeanDependencyGraph` -
-`MapperModel` - `SqlStatementModel` - `Finding` - `Evidence` -
-`AnalysisMetadata`
+禁止：
+- import MCP 类型、Spring AI 类型、Spring Web 类型。
+- 直接调用 `Files` / `Path` / 网络。
+- 决定 HTTP/协议层错误。
 
-核心模型不得依赖 Spring AI MCP 的 Request/Result 类型。
+### 4.4 Infrastructure
 
-### 4.4 Infrastructure Layer
+职责：
+- 实现 Workspace 端口：路径校验、文件枚举、受限读取。
+- 实现解析端口：JavaParser、Maven Model/Resolver、XML、SQL、YAML。
+- 实现脱敏器、配置加载、日志。
+- 提供时钟与预算检查。
 
-职责： - Workspace 受控文件访问； - 文件枚举、编码处理和大小限制； -
-路径规范化与越权检测； - Maven 本地仓库和解析器适配； - 敏感信息脱敏； -
-日志、指标和性能计时。
+禁止：
+- 承载业务规则。
+- 直接返回 MCP 结构。
+- 向 stdout 输出任何内容。
 
-所有文件访问必须通过统一的 Workspace
-API，不允许分析器自行拼接任意路径读取。
+### 4.5 端口清单（V0.1）
 
-## 5. 建议包结构
+端口定义在 `analysis.port` 包，实现位于 `infrastructure`。
 
-以下为建议结构，可根据实际依赖和复杂度调整；不要求一开始创建空包或过度抽象。
+| 端口 | 职责 | 关键约束 |
+| --- | --- | --- |
+| `WorkspacePort` | 根路径、枚举、读取文本/字节 | 只读；带预算与 deadline；拒绝符号链接 |
+| `SourceReader` | 按字符集读取 Java/文本文件 | 有 `maxBytes` 与 charset；返回是否发生编码回退 |
+| `MavenModelPort` | 构建有效 POM 模型 | 不执行构建；离线优先 |
+| `MavenResolutionPort` | 解析依赖树与仲裁结果 | 离线优先；远程需显式授权 |
+| `XmlParsePort` | 安全解析 XML | 强制禁用 DTD 与外部实体 |
+| `SqlParsePort` | 解析 SQL 结构 | 失败降级，不猜测 |
+| `Redactor` | 文本与结构脱敏 | 出口强制调用 |
+| `ClockPort` | 计时与 deadline 判定 | 便于测试注入 |
 
-``` text
+端口只暴露分析所需的最小能力，不暴露通用文件系统 API。
+
+## 5. 包结构（V0.1）
+
+遵循"按需创建，不建空包"。
+
+```text
 src/main/java/.../
 ├── JavaBackendMcpApplication.java
 ├── mcp/
 │   ├── ProjectTools.java
-│   ├── MavenTools.java
+│   ├── DependencyTools.java
 │   ├── SpringTools.java
 │   └── MyBatisTools.java
 ├── application/
-│   ├── project/
-│   ├── maven/
-│   ├── spring/
-│   └── mybatis/
+│   ├── InspectProjectUseCase.java
+│   ├── AnalyzeDependenciesUseCase.java
+│   ├── InspectSpringUseCase.java
+│   ├── InspectMyBatisUseCase.java
+│   └── WorkspaceRegistry.java
 ├── analysis/
-│   ├── project/
-│   ├── dependency/
-│   ├── spring/
-│   ├── mybatis/
-│   ├── sql/
-│   ├── finding/
-│   └── evidence/
+│   ├── model/        # 领域模型
+│   ├── port/         # 端口接口
+│   ├── project/      # 项目画像与模块图
+│   ├── dependency/   # Maven 依赖分析
+│   ├── spring/       # 配置与组件候选
+│   ├── mybatis/      # Mapper 与 SQL
+│   ├── rule/         # 规则实现（普通类，无注册中心）
+│   └── evidence/     # 证据与 Finding 构建
 ├── infrastructure/
-│   ├── workspace/
-│   ├── filesystem/
-│   ├── maven/
-│   ├── parser/
-│   ├── security/
-│   └── observability/
-└── shared/
-    ├── result/
-    ├── error/
-    └── validation/
+│   ├── workspace/    # WorkspacePort 实现
+│   ├── maven/        # Maven Model/Resolver 适配
+│   ├── parser/       # Java/XML/SQL/YAML 适配
+│   ├── security/     # 路径校验、敏感过滤、脱敏
+│   └── config/       # 启动配置
+└── contract/         # 对外结果 DTO（与 result-contract 一一对应）
 ```
 
-测试目录应按单元、集成和样例分层：
-
-``` text
-src/test/
-├── java/
-│   ├── .../unit/
-│   └── .../integration/
-└── resources/
-    └── fixtures/
-        ├── simple-spring-boot/
-        ├── multi-module-project/
-        ├── dependency-conflicts/
-        └── mybatis-mappers/
-benchmark/
-├── fixtures/
-├── expected/
-└── README.md
-```
+说明：
+- `contract` 是对外稳定结构，字段语义以 `result-contract.md` 为准。
+- V0.1 允许内部模型直接复用 `contract` 类型，避免为映射而映射；只有当内部
+  模型需要独立演进时，才引入 assembler，并保证对外结构不变。
+- 不设 `observability`、`metrics`、`plugin` 包。
+- 规则用 `Rule` 接口 + 显式列表装配，不实现注册中心或 SPI。
 
 ## 6. 核心数据流
 
-以 `analyze_maven_dependencies` 为例：
+以 `analyze_dependencies` 为例：
 
-1.  MCP Client 发起 Tool 调用，传入 Workspace 标识/路径和分析选项。
-2.  MCP Adapter 校验参数并调用 Application 用例。
-3.  Workspace Manager 验证根目录授权、规范化路径并创建只读访问上下文。
-4.  Maven Analyzer 定位 POM，构建 Maven 模型并解析依赖。
-5.  Dependency Analyzer 构建模块依赖和传递依赖路径。
-6.  Rule Engine 识别版本冲突、重复依赖等发现。
-7.  Evidence Collector 收集 POM 路径、依赖路径、版本仲裁信息等证据。
-8.  Finding Aggregator 构建统一结果。
-9.  MCP Adapter 序列化结果并返回 Client。
+1. Adapter 校验 schema，调用 `AnalyzeDependenciesUseCase`。
+2. Application 校验 `workspaceId` 是否注册，解析 scope 与 budget。
+3. Application 创建 `Deadline` 与预算上下文。
+4. Analysis 通过 `MavenModelPort` 读取有效 POM（离线优先）。
+5. Analysis 通过 `MavenResolutionPort` 解析依赖树与仲裁结果。
+6. 规则层识别版本冲突、重复依赖、未解析依赖。
+7. 证据构建器生成 `DEPENDENCY_PATH` 证据（多跳）。
+8. Application 汇总 `status`（含 PARTIAL 判定）与 metadata。
+9. Adapter 序列化，输出前经过 `Redactor`。
 
-其他分析用例遵循相同流程：输入校验 → 安全 Workspace → 解析/建模 →
-规则分析 → 证据收集 → 统一结果。
+其他用例共用同一骨架：授权 → 预算 → 读取 → 建模 → 规则 → 证据 → 汇总。
 
-## 7. 统一结果模型
+## 7. 结果模型
 
-建议 Java 类型（具体命名可在实现中调整）：
+字段定义、枚举值与示例全部以 `docs/result-contract.md` 为准，本文不重复。
 
-``` java
-public record AnalysisResult(
-    boolean success,
-    String summary,
-    List<Finding> findings,
-    AnalysisMetadata metadata,
-    List<AnalysisWarning> warnings,
-    List<AnalysisError> errors
-) {}
+架构层面的约束：
 
-public record Finding(
-    String code,
-    Severity severity,
-    String title,
-    FindingKind kind,
-    SourceLocation location,
-    List<Evidence> evidence,
-    String description,
-    String suggestion,
-    Double confidence
-) {}
-
-public record SourceLocation(
-    String path,
-    Integer line,
-    Integer column,
-    String symbol
-) {}
-
-public record Evidence(
-    String type,
-    String source,
-    Integer line,
-    String excerpt,
-    String explanation
-) {}
-```
-
-注意： - 以上是概念模型，不是要求照抄的最终 API。 - `confidence`
-可选；没有合理依据时不填写。 - `line`、`column`
-不可用时为空，禁止编造。 - `FindingKind` 至少区分
-`FACT`、`RULE_MATCH`、`RISK_INFERENCE`。 - `severity`
-表示影响级别，不代表分析置信度。 - 对外 JSON
-字段命名、枚举值和向后兼容策略需要在实现前固定。
+1. 事实型产物进 `data`，`findings` 只放需要被关注的问题。
+2. 每个 Finding 必须带 `certainty` 与 `unresolved`。
+3. 多跳证据通过 `Evidence.hops[]` 表达，不允许把路径拼成字符串。
+4. `status` 由 Application 统一判定，分析器不得自行决定。
+5. 任何列表输出都必须有上限并记录截断。
 
 ## 8. 项目理解模型
 
-### 8.1 V0.1 项目画像
+### 8.1 ProjectModel（V0.1）
 
-`ProjectModel` 至少考虑： - 项目根目录（对外返回时可相对化）； -
-构建系统； - 模块列表； - 每个模块的 POM 路径、artifact 坐标和子模块； -
-Java/JDK 目标版本（若能可靠识别）； - Spring Boot
-版本（若能可靠识别）； - 关键技术依赖； - 启动类候选； -
-配置文件清单； - 未识别或冲突信息。
+- 构建系统（MAVEN）
+- 模块列表：路径、`groupId`、`artifactId`、`version`、`packaging`
+- `javaVersion`、`springBootVersion`（能可靠识别时才有值）
+- 模块依赖图（声明级）
+- 启动类候选（`@SpringBootApplication`）
+- 配置文件清单（不含值）
+- 关键技术依赖
+- 无法识别项 `unknown[]`
 
 ### 8.2 模块依赖图
 
--   节点代表 Maven module；
--   有向边代表声明的模块依赖；
--   需要区分直接依赖与传递依赖；
--   缺失模块、重复坐标和无法解析的依赖应作为 warning；
--   输出结构化节点和边，图形渲染由 Client 或后续工具完成。
+- 节点为 Maven module（`g:a` 或相对路径）。
+- 边为 POM 中声明的模块依赖。
+- 只表达"声明关系"，不表达运行时类路径顺序。
+- 缺失模块、坐标重复、无法解析的父 POM 记入 `warnings`。
 
-### 8.3 后续关系分析
+### 8.3 后续版本
 
-后续可增加： - Spring Bean 候选依赖图； - Controller/Service/Mapper
-层级关系； - 方法调用图； - 接口入口到数据访问层的局部调用链； -
-变更影响候选集合。
+调用图、接口入口调用链、变更影响集合属于 V0.3，V0.1 不实现，
+也不在模型中预留空字段。模型演进通过新增可选字段完成。
 
-静态调用分析需考虑接口多态、继承、代理、反射、异步和框架回调。对无法解析的动态关系必须标注
-unknown/partial，不得声称完整。
+## 9. 工程诊断
 
-## 9. 工程诊断设计
+### 9.1 Maven 依赖
 
-### 9.1 Maven
+解析模式：
 
-输入：Workspace、目标模块/分析选项。\
-处理：POM 模型、依赖解析、版本仲裁和依赖路径分析。\
-输出：依赖树摘要、冲突/重复发现、版本来源和证据。
+| 模式 | 行为 |
+| --- | --- |
+| `OFFLINE`（默认） | 只读本地仓库与项目内 `relativePath` 父 POM；缺失记 warning |
+| `REMOTE_AUTHORIZED` | 仅在启动配置显式开启且仓库在白名单时生效 |
 
-需要明确区分： - 声明版本； - dependencyManagement 管理版本； -
-传递依赖请求版本； - Maven 最终选定版本。
+规则要求：
 
-不能仅因依赖路径出现多个版本就直接断言运行时一定存在多个版本冲突。
+- 必须区分声明版本、`dependencyManagement` 版本、传递请求版本、最终选定版本。
+- 不得因为出现多个请求版本就断言运行时存在多个版本。
+- 未解析依赖不得猜测版本；输出 `certainty=PARTIAL` 或 warning。
+- 不执行 `mvn`，不调用 `maven-invoker`，不触发目标项目插件。
 
-### 9.2 Spring Boot
+### 9.2 Spring（V0.1 边界）
 
-V0.1 候选能力： - 识别 application.yml/yaml/properties 及 profile
-配置； - 提取配置键并进行敏感信息脱敏； - 识别启动类和组件扫描范围； -
-识别常见注解与 Bean 声明； - 构建可解释的 Bean 候选依赖关系； -
-检查部分常见配置风险。
+V0.1 做：
 
-静态扫描无法完整模拟 Spring 条件装配、运行时
-Profile、FactoryBean、代理和自定义注册过程。结果必须说明覆盖范围。
+- 识别 `application*.yml/yaml/properties` 与 profile 后缀文件。
+- 提取配置键；敏感键的值一律 `<redacted>`。
+- 识别 `@SpringBootApplication`、`@ComponentScan` 的扫描包。
+- 识别带 `@Component/@Service/@Repository/@Controller/@RestController/@Configuration`
+  的候选类（声明级）。
+- 识别构造器注入的声明类型（名称级）。
+- 一组经过测试的配置风险规则。
+
+V0.1 **不做**（必须写进 Tool 描述）：
+
+- 不构建完整 Bean 依赖图。
+- 不求值 `@Conditional*`、profile、`@Import`、自动配置。
+- 不解析 `FactoryBean`、代理、`BeanPostProcessor` 产生的对象。
+- 不解析占位符的真实值；`${...}` 标记为 `PLACEHOLDER`。
+- 不展开 Lombok / MapStruct 生成的成员。
 
 ### 9.3 MyBatis / SQL
 
--   解析 Mapper XML；
--   识别 namespace、statement id、SQL 类型和 SQL 文本；
--   尽可能匹配 Mapper 接口方法；
--   解析动态 SQL 时区分静态可确定片段与运行时动态部分；
--   使用 SQL Parser 识别结构，再应用规则；
--   每条 SQL 风险给出规则依据、SQL 位置和适用限制。
+- 解析 Mapper XML：namespace、statement id、SQL 类型、SQL 文本。
+- 尽可能按 namespace + 方法名匹配 Mapper 接口（名称级，不放宽为模糊匹配）。
+- 动态标签（`<if>`、`<foreach>`、`<choose>`）生成骨架节点，标记
+  `DYNAMIC_SQL`，`certainty=PARTIAL`。
+- `${}` 拼接直接产出 SQL 注入风险规则，不尝试还原。
+- SQL 规则必须写明适用范围与误报边界；解析失败记 `UNSUPPORTED_SYNTAX`。
 
-"缺少
-WHERE""分页方式""潜在全表扫描"等规则必须谨慎定义，不能只用简单字符串匹配就输出高严重度结论。
+## 10. Workspace 与安全
 
-## 10. Workspace 与安全架构
+安全要求全部定义在 `docs/SECURITY.md`。架构侧只固定接口形态：
 
-建议提供统一接口：
-
-``` java
-public interface Workspace {
+```java
+public interface WorkspacePort {
     Path root();
-    List<WorkspaceFile> listFiles(ScanOptions options);
-    Optional<String> readText(String relativePath);
-    Optional<byte[]> readBytes(String relativePath, long maxBytes);
+    List<WorkspaceFile> list(ScanOptions options, Budget budget);
+    Optional<TextFile> readText(RelativePath path, ReadLimits limits);
+    Optional<byte[]> readBytes(RelativePath path, long maxBytes);
 }
 ```
 
-安全要求： - 根目录在启动或请求时显式授权； - `resolve`
-后进行规范化和根目录包含性验证； - 考虑符号链接逃逸； -
-不允许绝对路径越权； - 限制扫描深度、文件数量、单文件大小和总字节数； -
-排除构建产物、版本控制目录和无关大目录； -
-只读打开文件，不提供写入接口； - 对异常和日志中的敏感信息脱敏。
+约束：
 
-不要把 `Path` 从未经校验的 MCP 参数直接传给 `Files.readString`。
+- 只接受 `RelativePath` 值对象，构造时即校验（非绝对、无 `..`）。
+- 所有方法都接受预算或限制参数，没有"无限读"的重载。
+- 返回 `TextFile` 时携带实际字符集与是否回退。
+- 不提供写方法，不提供删除/重命名。
+- 符号链接处理与 TOCTOU 边界按 SECURITY.md 第 4 节执行。
 
-## 11. MCP Tool 设计原则
+## 11. Tool 设计（V0.1）
 
-Tool 应按用户任务设计，而不是按内部方法一一暴露。
+四个 Tool 按用户任务划分，公共入参见 result-contract 第 8 节。
 
-每个 Tool： - 名称稳定、描述明确； - 参数有类型、范围和默认值； -
-说明分析范围、可能耗时和局限； - 输出统一结构； -
-对无效路径、解析失败、不支持项目返回可理解错误； -
-不返回无关的大量源码； -
-允许用户指定模块或分析范围，避免每次扫描整个仓库。
+### 11.1 `inspect_project`
 
-候选 Tool 仅作能力清单，不锁定最终数量： - `inspect_java_project` -
-`inspect_spring_boot` - `inspect_spring_config` -
-`analyze_maven_dependencies` - `find_dependency_conflicts` -
-`inspect_mybatis_mappers` - `analyze_sql_patterns`
+- 用途：了解项目结构、模块、技术栈、入口、配置文件。
+- 专属入参：`options.includeConfigFiles`（默认 true）。
+- `data`：项目画像 + 模块图 + 启动类 + 配置清单 + 技术栈。
+- `findings`：通常为空；结构性问题走 `warnings`。
 
-Tool 数量由真实用例、参数复杂度和 Client 使用体验决定。
+### 11.2 `analyze_dependencies`
+
+- 用途：查看依赖树、仲裁结果、冲突与传递路径。
+- 专属入参：`module`（可选）、`options.includeTransitive`（默认 true）、
+  `options.maxDepth`（默认 10）、`options.resolutionMode`
+  （`OFFLINE` / `REMOTE_AUTHORIZED`）。
+- `data`：依赖树与选定版本。
+- `findings`：`DEP-*` 冲突、重复、未解析。
+
+### 11.3 `inspect_spring`
+
+- 用途：配置键、组件扫描范围、Bean 候选与配置风险。
+- 专属入参：`options.includeBeanCandidates`（默认 true）。
+- `data`：配置文件、配置键（值已掩码）、扫描范围、Bean 候选、`limitations[]`。
+- `findings`：`SPR-*`。
+- Tool 描述中必须写明 9.2 的"不做"清单。
+
+### 11.4 `inspect_mybatis`
+
+- 用途：Mapper/XML 对应关系、SQL 提取与规则检查。
+- 专属入参：`options.includeSqlText`（默认 true）、
+  `options.maxSqlLength`（默认 100 KiB）。
+- `data`：mapper、statement、SQL 文本（已脱敏）、动态标记。
+- `findings`：`MAP-*`、`SQL-*`。
+
+通用要求：Tool 描述必须写明能力边界、可能耗时与不支持项；
+不允许把 V0.2/V0.3 能力写进描述。
 
 ## 12. 错误处理
 
-区分： - 输入错误：参数缺失、格式错误、选项不支持； -
-权限错误：Workspace 未授权、路径越界； - 项目错误：不是受支持项目、POM
-无法解析； - 部分分析：部分文件不支持或解析失败； -
-系统错误：内部异常、超时、资源限制。
+| 层次 | 触发条件 | 返回方式 |
+| --- | --- | --- |
+| 协议错误 | JSON-RPC 非法、未知方法 | MCP 框架协议错误 |
+| 调用错误 | Tool 未知、参数不符合 schema | Tool 错误（`isError=true`） |
+| 业务错误 | 工作区未授权、项目不支持、超时、内部异常 | 信封 `status=FAILED` + `errors[]` |
+| 部分成功 | 有跳过/截断/未解析 | 信封 `status=PARTIAL` + `warnings[]` |
 
-可预期错误应转成稳定错误码和可操作说明。堆栈只进入受控日志，不直接返回
-Client。部分分析成功时，应明确标记 `partial` 并列出跳过项。
+- 业务错误码与 `AnalysisError` 字段定义见 result-contract 第 5.6/5.7 节。
+- 堆栈只进受控日志，不返回 Client。
+- 参数通过 schema 校验后，一切失败都走信封，保证 `code` 稳定。
 
-## 13. 测试与 Benchmark 架构
+## 13. 运行形态与 STDIO
 
-### 13.1 单元测试
+硬约束：
 
-针对： - POM 模型和版本仲裁； - 配置解析； - Mapper/XML 映射； - SQL
-规则； - 路径安全； - 脱敏； - Finding/Evidence 序列化。
+1. **stdout 只用于 MCP JSON-RPC 通信**。任何非协议内容写入 stdout 都会
+   破坏连接。
+2. 所有日志输出到 **stderr**：Logback `ConsoleAppender` 的 target 设为
+   `System.err`。
+3. 关闭 Spring Boot banner：`spring.main.banner-mode=off`。
+4. 禁止 `System.out.print*`；代码评审与静态检查都要覆盖。
+5. 第三方库若默认向 stdout 打印，必须显式重定向或禁用。
 
-### 13.2 集成测试
+启动方式（示例，参数细节待定）：
 
-覆盖： - Spring Context 启动； - MCP Tool 注册； - 参数校验； - STDIO
-或合适的 MCP Client 测试方式； - 正常、错误和部分成功返回。
+```text
+java -jar java-backend-mcp.jar \
+  --workspace=demo:/path/to/project \
+  --spring.profiles.active=stdio
+```
 
-### 13.3 Benchmark
+集成测试要求：
 
-每个 fixture 应有： - 可复现输入项目； - 预期项目画像/发现； -
-预期证据位置； - 正例与反例； - 已知不支持语法； -
-测试说明和来源许可证。
+- 启动真实进程，发送 `initialize`，断言 stdout 每行均为合法 JSON-RPC。
+- 断言 stderr 至少包含启动日志。
+- 断言分析请求在前述条件下可完成。
 
-评估维度： - True Positive / False Positive / False
-Negative（适用时）； - 证据位置正确率； - 分析覆盖率； -
-扫描耗时和资源占用。
+## 14. 测试与 Benchmark
 
-## 14. 演进原则
+### 14.1 单元测试
 
--   先以模块化单体实现，不因"微服务"或"插件化"愿景过早拆服务。
--   先建立稳定的领域模型和分析器接口，再考虑插件机制。
--   不在 V0.1 同时支持 STDIO 和 HTTP。
--   不将 MCP SDK 类型泄漏到分析核心。
--   不因未来需求创建大量空接口、空模块。
--   每次扩展都必须有真实用户场景和测试样例。
--   架构变化通过 ADR 记录，涉及重大边界调整先由项目负责人确认。
+- 领域模型与规则（正例、反例、边界）。
+- SymbolId 与 SourceLocation 构造与校验。
+- 证据构建（单点与多跳）。
+- 脱敏器与敏感键判定。
 
-## 15. 待技术验证项
+### 14.2 契约测试
 
--   Spring Boot 与 Spring AI MCP 的稳定兼容矩阵；
--   STDIO 启动、日志输出和打包方式；
--   JavaParser 对目标 Java 语法级别的支持；
--   Maven Resolver 对本地仓库、父 POM、BOM 和 Profile 的处理；
--   JSQLParser 对 MySQL 方言和 MyBatis 动态 SQL 的支持边界；
--   Windows/macOS/Linux 路径与权限行为；
--   大型项目扫描性能和资源限制。
+- 每个 Tool 的响应通过 JSON Schema 校验。
+- `status`、`errors`、`warnings`、`metadata.truncations` 的一致性规则。
+- 兼容性：新增字段不影响旧客户端解析。
+
+### 14.3 安全测试
+
+按 `SECURITY.md` 第 11 节逐项实现，必须使用真实文件系统行为，
+不得全部用 mock 替代。
+
+### 14.4 集成测试
+
+- Spring Context + Tool 注册 + 参数校验。
+- STDIO 端到端（含 stdout 纯净性）。
+- 多模块 fixture、依赖冲突 fixture、MyBatis fixture。
+
+### 14.5 Benchmark
+
+- 记录 fixture 规模、耗时、内存、跳过项。
+- 输出 TP/FP/FN 与证据位置正确率（适用时）。
+- 不承诺固定阈值，先建立基线。
+
+## 15. 演进原则
+
+- 模块化单体，不提前拆服务。
+- 契约先行：先改 result-contract，再改实现。
+- 新能力必须有真实场景与 fixture，否则不进入路线图。
+- 引入缓存前先证明必要性，并定义失效策略与内存上限。
+- 架构级变更通过 ADR 记录。
+
+## 16. 待技术验证项
+
+- Spring Boot 与 Spring AI MCP 的兼容矩阵。
+- Spring AI MCP 的 STDIO 启动与工具注册方式。
+- Maven Resolver 离线模式对父 POM、BOM、profile 的实际行为。
+- JavaParser 对目标 Java 语言级别的支持范围。
+- JSQLParser 对 MySQL 方言与 MyBatis 动态 SQL 的边界。
+- 大项目下 20k 文件 / 200 MiB 预算的实际耗时与内存占用。
